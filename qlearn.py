@@ -7,20 +7,15 @@ from skimage import transform, color, exposure
 from skimage.transform import rotate
 from skimage.viewer import ImageViewer
 import sys
-sys.path.append("game/")
+sys.path.append("./game/")
 import wrapped_flappy_bird as game
 import random
 import numpy as np
 from collections import deque
 
 import json
-from keras.initializers import normal, identity
-from keras.models import model_from_json
-from keras.models import Sequential
-from keras.layers.core import Dense, Dropout, Activation, Flatten
-from keras.layers.convolutional import Convolution2D, MaxPooling2D
-from keras.optimizers import SGD , Adam
-import tensorflow as tf
+import torch
+import torch.nn as nn
 
 GAME = 'bird' # the name of the game being played for log files
 CONFIG = 'nothreshold'
@@ -31,7 +26,7 @@ EXPLORE = 3000000. # frames over which to anneal epsilon
 FINAL_EPSILON = 0.0001 # final value of epsilon
 INITIAL_EPSILON = 0.1 # starting value of epsilon
 REPLAY_MEMORY = 50000 # number of previous transitions to remember
-BATCH = 32 # size of minibatch
+BATCH = 128 # size of minibatch
 FRAME_PER_ACTION = 1
 LEARNING_RATE = 1e-4
 
@@ -39,26 +34,47 @@ img_rows , img_cols = 80, 80
 #Convert image into Black and white
 img_channels = 4 #We stack 4 frames
 
-def buildmodel():
-    print("Now we build the model")
-    model = Sequential()
-    model.add(Convolution2D(32, 8, 8, subsample=(4, 4), border_mode='same',input_shape=(img_rows,img_cols,img_channels)))  #80*80*4
-    model.add(Activation('relu'))
-    model.add(Convolution2D(64, 4, 4, subsample=(2, 2), border_mode='same'))
-    model.add(Activation('relu'))
-    model.add(Convolution2D(64, 3, 3, subsample=(1, 1), border_mode='same'))
-    model.add(Activation('relu'))
-    model.add(Flatten())
-    model.add(Dense(512))
-    model.add(Activation('relu'))
-    model.add(Dense(2))
-   
-    adam = Adam(lr=LEARNING_RATE)
-    model.compile(loss='mse',optimizer=adam)
-    print("We finish building the model")
-    return model
 
-def trainNetwork(model,args):
+class DQN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Sequential(nn.Conv2d(in_channels=4, out_channels=32, kernel_size=8, stride=4, padding = 2,bias=False),
+                              nn.ReLU(inplace=True),
+                              nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=1, bias=False),
+                              nn.ReLU(inplace=True),
+                              nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding = 1,bias=False),
+                              nn.ReLU(inplace=True),
+                                   ).to(torch.float64)
+        self.mlp =  nn.Sequential(nn.Flatten(),
+                                  nn.Linear(in_features = 6400, out_features=512),
+                                  nn.ReLU(inplace=True),
+                                  nn.Linear(in_features = 512, out_features=2),
+                                  ).to(torch.float64)
+    def forward(self,x):
+        x = torch.tensor(x)
+        x = x.to('cuda:2')
+        x = self.conv(x)
+        x = x.unsqueeze(0)
+        x = self.mlp(x)
+        return x
+
+def inference(x,network):
+    return network(x)
+
+def PlayGame(args):
+
+    if args['mode'] == 'Run':
+        OBSERVE = 999999999    #We keep observe, never train
+        epsilon = FINAL_EPSILON
+        model_path = "./model.pth"
+        network = torch.load(model_path)
+    else:                       #We go to training mode
+        network = DQN()
+        OBSERVE = OBSERVATION
+        epsilon = INITIAL_EPSILON
+    device = 'cuda:2'
+    network.to(device)
+
     # open up a game state to communicate with emulator
     game_state = game.GameState()
 
@@ -76,42 +92,23 @@ def trainNetwork(model,args):
 
     x_t = x_t / 255.0
 
-    s_t = np.stack((x_t, x_t, x_t, x_t), axis=2)
-    #print (s_t.shape)
-
-    #In Keras, need to reshape
-    s_t = s_t.reshape(1, s_t.shape[0], s_t.shape[1], s_t.shape[2])  #1*80*80*4
-
-    
-
-    if args['mode'] == 'Run':
-        OBSERVE = 999999999    #We keep observe, never train
-        epsilon = FINAL_EPSILON
-        print ("Now we load weight")
-        model.load_weights("model.h5")
-        adam = Adam(lr=LEARNING_RATE)
-        model.compile(loss='mse',optimizer=adam)
-        print ("Weight load successfully")    
-    else:                       #We go to training mode
-        OBSERVE = OBSERVATION
-        epsilon = INITIAL_EPSILON
-
+    s_t = np.stack((x_t, x_t, x_t, x_t)) #4*80*80
     t = 0
-    while (True):
+    while(True):
         loss = 0
         Q_sa = 0
+        epoch = 0
         action_index = 0
         r_t = 0
         a_t = np.zeros([ACTIONS])
-        #choose an action epsilon greedy
+        # choose an action epsilon greedy
         if t % FRAME_PER_ACTION == 0:
             if random.random() <= epsilon:
-                print("----------Random Action----------")
                 action_index = random.randrange(ACTIONS)
                 a_t[action_index] = 1
             else:
-                q = model.predict(s_t)       #input a stack of 4 images, get the prediction
-                max_Q = np.argmax(q)
+                q = network(s_t)  # input a stack of 4 images, get the prediction
+                max_Q = torch.argmax(q)
                 action_index = max_Q
                 a_t[max_Q] = 1
 
@@ -130,38 +127,61 @@ def trainNetwork(model,args):
         x_t1 = x_t1 / 255.0
 
 
-        x_t1 = x_t1.reshape(1, x_t1.shape[0], x_t1.shape[1], 1) #1x80x80x1
-        s_t1 = np.append(x_t1, s_t[:, :, :, :3], axis=3)
+        x_t1 = x_t1.reshape(1, x_t1.shape[0], x_t1.shape[1])
+        s_t1 = np.append(x_t1, s_t[:3, :, :], axis=0)
 
         # store the transition in D
         D.append((s_t, action_index, r_t, s_t1, terminal))
         if len(D) > REPLAY_MEMORY:
             D.popleft()
 
-        #only train if done observing
+        # only train if done observing
         if t > OBSERVE:
-            #sample a minibatch to train on
+            # 抽取小批量样本进行训练
             minibatch = random.sample(D, BATCH)
+            # inputs和targets一起构成了Q值表
+            # inputs = torch.zeros((BATCH, s_t.shape[0], s_t.shape[1], s_t.shape[2]))  # 32, 4, 80, 80
+            targets = torch.zeros((BATCH, ACTIONS))  # 32, 2
+            targets_Q = torch.zeros((BATCH, ACTIONS))  # 32, 2
 
-            #Now we do the experience replay
-            state_t, action_t, reward_t, state_t1, terminal = zip(*minibatch)
-            state_t = np.concatenate(state_t)
-            state_t1 = np.concatenate(state_t1)
-            targets = model.predict(state_t)
-            Q_sa = model.predict(state_t1)
-            targets[range(BATCH), action_t] = reward_t + GAMMA*np.max(Q_sa, axis=1)*np.invert(terminal)
+            # 开始经验回放
+            for i in range(0, len(minibatch)):
+                # 以下序号对应D的存储顺序将信息全部取出，
+                # D.append((s_t, action_index, r_t, s_t1, terminal))
+                state_t = minibatch[i][0]  # 当前状态
+                action_t = minibatch[i][1]  # 输入动作
+                reward_t = minibatch[i][2]  # 返回奖励
+                state_t1 = minibatch[i][3]  # 返回的下一状态
+                terminal = minibatch[i][4]  # 返回的是否终止的标志
 
-            loss += model.train_on_batch(state_t, targets)
+
+                # 得到预测的以输入动作x为索引的Q值列表
+                targets[i] = network(state_t)
+                targets_Q[i] = network(state_t)
+                # 得到下一状态下预测的以输入动作x为索引的Q值列表
+                Q_sa = network(state_t1)
+                if terminal:  # 如果动作执行后游戏终止了，该状态下(s)该动作(a)的Q值就相当于奖励
+                    targets[i, action_t] = reward_t
+                    epoch += 1
+                else:  # 否则，该状态(s)下该动作(a)的Q值就相当于动作执行后的即时奖励和下一状态下的最佳预期奖励乘以一个折扣率
+                    targets[i, action_t] = reward_t + GAMMA * torch.max(Q_sa,axis=1)[0]
+
+            # update network
+            optimizer = torch.optim.Adam(network.parameters(), lr=0.01)
+            loss_func = torch.nn.MSELoss()
+            loss_t = loss_func(targets_Q,targets)
+            loss +=loss_t
+
+            optimizer.zero_grad()
+            loss_t.backward()
+            optimizer.step()
 
         s_t = s_t1
         t = t + 1
 
         # save progress every 10000 iterations
         if t % 1000 == 0:
-            print("Now we save model")
-            model.save_weights("model.h5", overwrite=True)
-            with open("model.json", "w") as outfile:
-                json.dump(model.to_json(), outfile)
+            torch.save(network,"./model.pt")
 
         # print info
         state = ""
@@ -172,27 +192,15 @@ def trainNetwork(model,args):
         else:
             state = "train"
 
-        print("TIMESTEP", t, "/ STATE", state, \
-            "/ EPSILON", epsilon, "/ ACTION", action_index, "/ REWARD", r_t, \
-            "/ Q_MAX " , np.max(Q_sa), "/ Loss ", loss)
+        print("STATE", state,"/ epoch", epoch)
 
     print("Episode finished!")
     print("************************")
 
-def playGame(args):
-    model = buildmodel()
-    trainNetwork(model,args)
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Description of your program')
     parser.add_argument('-m','--mode', help='Train / Run', required=True)
     args = vars(parser.parse_args())
-    playGame(args)
+    PlayGame(args)
 
-if __name__ == "__main__":
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    sess = tf.Session(config=config)
-    from keras import backend as K
-    K.set_session(sess)
-    main()
